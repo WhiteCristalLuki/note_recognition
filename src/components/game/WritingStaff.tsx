@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Check } from 'lucide-react'
 import type { FeedbackState, NotePitch } from '../../types'
 import { ANSWER_RANGES } from '../../lib/notes'
 import { nearestPitchAtY, type PitchPosition } from '../../lib/staffGeometry'
 import { renderWritingStaff, type DrawnNote } from '../../lib/vexflow'
 import { useTheme } from '../../hooks/useTheme'
+import {
+  needsWriteConfirm,
+  useCoarsePointer,
+} from '../../hooks/useCoarsePointer'
 
 interface WritingStaffProps {
   clef: 'treble' | 'bass'
@@ -11,15 +16,16 @@ interface WritingStaffProps {
   target: NotePitch
   disabled?: boolean
   feedback: FeedbackState
-  /** Выбранный пользователем ответ (после клика) */
+  /** Выбранный пользователем ответ (после подтверждения) */
   selected: NotePitch | null
   onSelect: (note: NotePitch) => void
   className?: string
 }
 
 /**
- * Режим «Запись»: клик по вертикали стана ставит целую ноту.
- * Hover — блёклая «призрачная» нота; клик — фиксация; ошибка — красная + правильная чёрная.
+ * Режим «Запись»: клик/тап по вертикали стана ставит целую ноту.
+ * ПК (мышь): клик сразу засчитывает ответ.
+ * Телефон/планшет: тап выбирает позицию, ответ — по кнопке «Подтвердить».
  */
 export function WritingStaff({
   clef,
@@ -33,11 +39,20 @@ export function WritingStaff({
   const containerRef = useRef<HTMLDivElement>(null)
   const positionsRef = useRef<PitchPosition[]>([])
   const isDark = useTheme()
+  const isCoarse = useCoarsePointer()
   const [widthTick, setWidthTick] = useState(0)
+  /** Призрачная нота при наведении мышью */
   const [hoverNote, setHoverNote] = useState<NotePitch | null>(null)
+  /** Выбранная, но ещё не подтверждённая нота (тач) */
+  const [pendingNote, setPendingNote] = useState<NotePitch | null>(null)
+  /** Тянем пальцем по стану */
+  const draggingRef = useRef(false)
 
   const staffColor = isDark ? '#e2e8f0' : '#1e293b'
-  const ghostColor = isDark ? 'rgba(148, 163, 184, 0.55)' : 'rgba(148, 163, 184, 0.7)'
+  const ghostColor = isDark
+    ? 'rgba(148, 163, 184, 0.55)'
+    : 'rgba(148, 163, 184, 0.7)'
+  const pendingColor = isDark ? '#94a3b8' : '#64748b'
   const lockedColor = isDark ? '#f1f5f9' : '#0f172a'
   const wrongColor = '#ef4444'
   const correctColor = isDark ? '#f1f5f9' : '#0f172a'
@@ -45,7 +60,6 @@ export function WritingStaff({
   const range = ANSWER_RANGES[clef]
 
   const buildNotes = useCallback((): DrawnNote[] => {
-    // После ответа
     if (feedback === 'correct' && selected) {
       return [{ note: selected, color: lockedColor }]
     }
@@ -54,13 +68,16 @@ export function WritingStaff({
       if (selected) {
         list.push({ note: selected, color: wrongColor })
       }
-      // Правильная нота — чёрная (если не совпала с выбранной)
       if (!selected || selected.midi !== target.midi) {
         list.push({ note: target, color: correctColor })
       }
       return list
     }
-    // Ожидание: призрачная нота при наведении
+    // Ожидание подтверждения на тач-устройстве
+    if (pendingNote && !disabled) {
+      return [{ note: pendingNote, color: pendingColor }]
+    }
+    // Призрак при наведении мышью
     if (hoverNote && !disabled) {
       return [{ note: hoverNote, color: ghostColor }]
     }
@@ -69,11 +86,13 @@ export function WritingStaff({
     feedback,
     selected,
     target,
+    pendingNote,
     hoverNote,
     disabled,
     lockedColor,
     wrongColor,
     correctColor,
+    pendingColor,
     ghostColor,
   ])
 
@@ -101,9 +120,10 @@ export function WritingStaff({
     void draw()
   }, [draw, widthTick])
 
-  // Сброс hover при смене раунда / блокировке
   useEffect(() => {
     setHoverNote(null)
+    setPendingNote(null)
+    draggingRef.current = false
   }, [target.midi, disabled, feedback])
 
   useEffect(() => {
@@ -126,7 +146,6 @@ export function WritingStaff({
     if (!el) return null
     const svg = el.querySelector('svg')
     const box = (svg ?? el).getBoundingClientRect()
-    // VexFlow рисует в пикселях 1:1; при CSS-масштабировании пересчитываем
     const renderH =
       svg instanceof SVGSVGElement
         ? Number(svg.getAttribute('height')) || box.height
@@ -144,26 +163,72 @@ export function WritingStaff({
 
   const onPointerMove = (e: React.PointerEvent) => {
     if (disabled || feedback !== 'idle') return
+
     const note = pitchFromEvent(e.clientY)
-    setHoverNote((prev) => {
-      if (prev?.midi === note?.midi) return prev
-      return note
-    })
+    if (!note) return
+
+    // На таче при перетаскивании обновляем предварительный выбор
+    if (needsWriteConfirm(e.pointerType)) {
+      if (draggingRef.current || pendingNote) {
+        setPendingNote((prev) =>
+          prev?.midi === note.midi ? prev : note,
+        )
+      }
+      return
+    }
+
+    // Мышь: призрачная нота
+    setHoverNote((prev) => (prev?.midi === note.midi ? prev : note))
   }
 
   const onPointerLeave = () => {
     if (feedback !== 'idle') return
     setHoverNote(null)
+    draggingRef.current = false
   }
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (disabled || feedback !== 'idle') return
     e.preventDefault()
+
     const note = pitchFromEvent(e.clientY)
-    if (note) {
+    if (!note) return
+
+    if (needsWriteConfirm(e.pointerType)) {
+      // Тач/стилус: только предварительный выбор
+      draggingRef.current = true
       setHoverNote(null)
-      onSelect(note)
+      setPendingNote(note)
+      try {
+        containerRef.current?.setPointerCapture(e.pointerId)
+      } catch {
+        /* noop */
+      }
+      return
     }
+
+    // Мышь: сразу ответ
+    setHoverNote(null)
+    setPendingNote(null)
+    onSelect(note)
+  }
+
+  const onPointerUp = (e: React.PointerEvent) => {
+    if (needsWriteConfirm(e.pointerType)) {
+      draggingRef.current = false
+      try {
+        containerRef.current?.releasePointerCapture(e.pointerId)
+      } catch {
+        /* noop */
+      }
+    }
+  }
+
+  const confirmPending = () => {
+    if (!pendingNote || disabled || feedback !== 'idle') return
+    const note = pendingNote
+    setPendingNote(null)
+    onSelect(note)
   }
 
   const feedbackRing =
@@ -173,24 +238,55 @@ export function WritingStaff({
         ? 'ring-2 ring-red-500/50'
         : ''
 
+  // Кнопка видна, когда есть предварительный выбор (тач/стилус)
+  const showConfirm =
+    !disabled && feedback === 'idle' && pendingNote !== null
+
   return (
-    <div
-      className={`overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition dark:border-slate-700 dark:bg-slate-900 ${feedbackRing} ${className}`}
-    >
+    <div className={`space-y-3 ${className}`}>
       <div
-        ref={containerRef}
-        role="img"
-        aria-label="Интерактивный нотный стан"
-        onPointerMove={onPointerMove}
-        onPointerLeave={onPointerLeave}
-        onPointerDown={onPointerDown}
-        className={`mx-auto w-full max-w-2xl touch-none select-none ${
-          disabled || feedback !== 'idle'
-            ? 'cursor-default'
-            : 'cursor-crosshair'
-        }`}
-        style={{ minHeight: 240 }}
-      />
+        className={`overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition dark:border-slate-700 dark:bg-slate-900 ${feedbackRing}`}
+      >
+        <div
+          ref={containerRef}
+          role="img"
+          aria-label="Интерактивный нотный стан"
+          onPointerMove={onPointerMove}
+          onPointerLeave={onPointerLeave}
+          onPointerDown={onPointerDown}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+          className={`mx-auto w-full max-w-2xl touch-none select-none ${
+            disabled || feedback !== 'idle'
+              ? 'cursor-default'
+              : 'cursor-crosshair'
+          }`}
+          style={{ minHeight: 240 }}
+        />
+      </div>
+
+      {/* Кнопка подтверждения — для тач-выбора */}
+      {showConfirm && (
+        <button
+          type="button"
+          onClick={confirmPending}
+          className="flex w-full items-center justify-center gap-2 rounded-2xl bg-brand-600 px-6 py-4 text-base font-bold text-white shadow-lg shadow-brand-600/25 transition hover:bg-brand-500 active:scale-[0.98] sm:py-3.5"
+        >
+          <Check className="h-5 w-5" strokeWidth={2.5} />
+          Подтвердить
+          {pendingNote ? (
+            <span className="rounded-lg bg-white/15 px-2 py-0.5 text-sm font-semibold">
+              {pendingNote.name}
+            </span>
+          ) : null}
+        </button>
+      )}
+
+      {isCoarse && !disabled && feedback === 'idle' && !pendingNote && (
+        <p className="text-center text-xs text-slate-400 dark:text-slate-500">
+          Коснитесь стана, чтобы выбрать позицию, затем нажмите «Подтвердить»
+        </p>
+      )}
     </div>
   )
 }
